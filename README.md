@@ -1,6 +1,8 @@
 # Happy Hacker News
 
-A happier way to browse Hacker News. Very much in-progress. End goal is to use LLM to evaluate content to apply filters to remove or reword content that hits certain keywords or topics. Motivation for this is being very tired of certain topics and people getting mentioned in nearly every submission regardless of how relevant it is. I realize the echo-chamber ramifications of this approach, but at the same time, no value is brought to my life be re-reading the same misinformation for the hundredth time. 
+A happier way to browse Hacker News. Very much in-progress. End goal is to use LLM to evaluate content to apply filters to remove or reword content that hits certain keywords or topics. My motivation for this is being very tired of certain topics and people getting mentioned in nearly every submission regardless of how relevant it is. I realize the echo-chamber ramifications of this approach, but at the same time, no value is brought to my life by re-reading the same misinformation for the hundredth time. 
+
+Soon to be deployed on an actual TLD.
 
 ## Features
 
@@ -54,8 +56,3 @@ A happier way to browse Hacker News. Very much in-progress. End goal is to use L
 ## License
 
 MIT
-
-## Acknowledgements
-
-- [Hacker News](https://news.ycombinator.com/) for the content
-- Inspired by various Hacker News readers and interfaces
