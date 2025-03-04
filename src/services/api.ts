@@ -22,8 +22,8 @@ export const fetchStories = async (page = 1, limit = 30): Promise<Story[]> => {
 
 export const refreshStories = async (): Promise<boolean> => {
   try {
-    console.log(`Refreshing stories from: ${API_URL}/fetch-stories`);
-    await axios.post(`${API_URL}/fetch-stories`);
+    console.log(`Refreshing stories from: ${API_URL}/fetch`);
+    await axios.post(`${API_URL}/fetch`);
     return true;
   } catch (error) {
     console.error("Error refreshing stories:", error);

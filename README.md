@@ -4,14 +4,6 @@ A happier way to browse Hacker News. Very much in-progress. End goal is to use L
 
 Soon to be deployed on an actual TLD.
 
-## Features
-
-- Fetches latest stories from Hacker News
-- Stores story data in a SQLite database
-- Displays stories in a clean, modern interface
-- Shows title, source domain, points, and comment count
-- Allows refreshing stories with a single click
-
 ## Tech Stack
 
 - **Frontend**: React, TypeScript, Vite

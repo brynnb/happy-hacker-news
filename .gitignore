@@ -22,9 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.cursor
 
 # Database
 hn.db
+*.db-journal
 
 # Environment variables
 .env
