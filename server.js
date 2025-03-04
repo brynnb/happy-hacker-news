@@ -6,6 +6,18 @@ import sqlite3 from "sqlite3";
 import axios from "axios";
 import * as cheerio from "cheerio";
 import fs from "fs";
+import dotenv from "dotenv";
+
+// Load environment variables
+dotenv.config();
+
+// Feature flags
+const AUTO_FETCH_ENABLED =
+  process.env.AUTO_FETCH_ENABLED === "true" ? true : false;
+const FETCH_MULTIPLE_PAGES =
+  process.env.FETCH_MULTIPLE_PAGES === "true" ? true : false;
+const CATEGORIZE_STORIES =
+  process.env.CATEGORIZE_STORIES === "true" ? true : false;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,16 +46,7 @@ const setupDatabase = () => {
     }
 
     const dbPath = path.join(__dirname, "hn.db");
-
-    // Delete the existing database file if it exists
-    if (fs.existsSync(dbPath)) {
-      try {
-        fs.unlinkSync(dbPath);
-        console.log("Deleted existing database file");
-      } catch (err) {
-        console.error("Error deleting database file:", err);
-      }
-    }
+    const isNewDatabase = !fs.existsSync(dbPath);
 
     db = new sqlite3.Database(dbPath, (err) => {
       if (err) {
@@ -65,7 +68,8 @@ const setupDatabase = () => {
           comments INTEGER,
           timestamp INTEGER NOT NULL,
           submission_datetime INTEGER,
-          position INTEGER
+          position INTEGER,
+          categories TEXT
         )
       `,
         (err) => {
@@ -75,11 +79,302 @@ const setupDatabase = () => {
             return;
           }
 
-          console.log("Database setup complete");
-          resolve(db);
+          // Check if categories column exists in stories table
+          db.all("PRAGMA table_info(stories)", (err, rows) => {
+            if (err) {
+              console.error("Error checking stories table schema:", err);
+            } else {
+              // Check if categories column exists
+              const hasCategories =
+                rows && rows.some((row) => row.name === "categories");
+
+              if (!hasCategories) {
+                console.log("Adding categories column to stories table");
+                db.run(
+                  "ALTER TABLE stories ADD COLUMN categories TEXT",
+                  (err) => {
+                    if (err) {
+                      console.error("Error adding categories column:", err);
+                    } else {
+                      console.log("Added categories column to stories table");
+                    }
+                  }
+                );
+              }
+            }
+          });
+
+          // Create prompts table
+          db.run(
+            `
+            CREATE TABLE IF NOT EXISTS prompts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              prompt_text TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              is_active INTEGER DEFAULT 1
+            )
+          `,
+            (err) => {
+              if (err) {
+                console.error("Error creating prompts table:", err);
+                reject(err);
+                return;
+              }
+
+              // Create topics table
+              db.run(
+                `
+                CREATE TABLE IF NOT EXISTS topics (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT NOT NULL UNIQUE,
+                  description TEXT,
+                  created_at INTEGER NOT NULL
+                )
+              `,
+                (err) => {
+                  if (err) {
+                    console.error("Error creating topics table:", err);
+                    reject(err);
+                    return;
+                  }
+
+                  // Create keywords table
+                  db.run(
+                    `
+                    CREATE TABLE IF NOT EXISTS keywords (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      topic_id INTEGER NOT NULL,
+                      keyword TEXT NOT NULL,
+                      created_at INTEGER NOT NULL,
+                      FOREIGN KEY (topic_id) REFERENCES topics (id),
+                      UNIQUE (topic_id, keyword)
+                    )
+                  `,
+                    (err) => {
+                      if (err) {
+                        console.error("Error creating keywords table:", err);
+                        reject(err);
+                        return;
+                      }
+
+                      // Check if we need to insert default data
+                      checkAndInsertDefaultData(isNewDatabase)
+                        .then(() => {
+                          resolve(db);
+                        })
+                        .catch((err) => {
+                          console.error("Error inserting default data:", err);
+                          resolve(db);
+                        });
+                    }
+                  );
+                }
+              );
+            }
+          );
         }
       );
     });
+  });
+};
+
+const checkAndInsertDefaultData = async (isNewDatabase) => {
+  // Only check if tables are empty if it's not a new database
+  if (!isNewDatabase) {
+    const [promptCount, topicCount] = await Promise.all([
+      getTableCount("prompts"),
+      getTableCount("topics"),
+    ]);
+
+    // If both tables have data, no need to insert defaults
+    if (promptCount > 0 && topicCount > 0) {
+      return;
+    }
+  }
+
+  // Insert default data
+  return insertDefaultPromptAndTopics();
+};
+
+const getTableCount = (tableName) => {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT COUNT(*) as count FROM ${tableName}`, (err, row) => {
+      if (err) {
+        console.error(`Error counting rows in ${tableName}:`, err);
+        resolve(0);
+        return;
+      }
+      resolve(row.count);
+    });
+  });
+};
+
+const insertDefaultPromptAndTopics = () => {
+  return new Promise((resolve, reject) => {
+    const timestamp = Date.now();
+
+    // Insert default prompt
+    db.run(
+      `INSERT INTO prompts (name, prompt_text, created_at) VALUES (?, ?, ?)`,
+      [
+        "Default Categorization Prompt",
+        `Analyze the following Hacker News post title and determine which categories it belongs to from the provided list. 
+Return ONLY a JSON array of category names, with no additional text or explanation.
+Example response: ["technology", "ai"]
+If no categories apply, return an empty array: []`,
+        timestamp,
+      ],
+      function (err) {
+        if (err) {
+          console.error("Error inserting default prompt:", err);
+          reject(err);
+          return;
+        }
+
+        console.log("Inserted default prompt");
+
+        // Insert default topics
+        const defaultTopics = [
+          {
+            name: "technology",
+            description: "General technology news and updates",
+          },
+          {
+            name: "ai",
+            description: "Artificial intelligence and machine learning",
+          },
+          {
+            name: "programming",
+            description: "Software development and programming",
+          },
+          {
+            name: "business",
+            description: "Business, startups, and entrepreneurship",
+          },
+          { name: "politics", description: "Political news and discussions" },
+          {
+            name: "science",
+            description: "Scientific discoveries and research",
+          },
+        ];
+
+        let topicsInserted = 0;
+
+        defaultTopics.forEach((topic) => {
+          db.run(
+            `INSERT INTO topics (name, description, created_at) VALUES (?, ?, ?)`,
+            [topic.name, topic.description, timestamp],
+            function (err) {
+              if (err) {
+                console.error(`Error inserting topic ${topic.name}:`, err);
+                // Continue with other topics
+              } else {
+                console.log(`Inserted topic: ${topic.name}`);
+
+                const topicId = this.lastID;
+
+                // Insert default keywords for each topic
+                const keywordsMap = {
+                  technology: [
+                    "tech",
+                    "software",
+                    "hardware",
+                    "gadget",
+                    "device",
+                    "innovation",
+                  ],
+                  ai: [
+                    "artificial intelligence",
+                    "machine learning",
+                    "neural network",
+                    "deep learning",
+                    "gpt",
+                    "llm",
+                    "chatgpt",
+                    "gemini",
+                    "claude",
+                  ],
+                  programming: [
+                    "code",
+                    "developer",
+                    "javascript",
+                    "python",
+                    "rust",
+                    "golang",
+                    "typescript",
+                    "framework",
+                    "library",
+                    "api",
+                  ],
+                  business: [
+                    "startup",
+                    "funding",
+                    "venture capital",
+                    "vc",
+                    "acquisition",
+                    "ipo",
+                    "entrepreneur",
+                    "ceo",
+                    "revenue",
+                    "profit",
+                  ],
+                  politics: [
+                    "government",
+                    "election",
+                    "policy",
+                    "biden",
+                    "trump",
+                    "congress",
+                    "senate",
+                    "democrat",
+                    "republican",
+                    "legislation",
+                  ],
+                  science: [
+                    "research",
+                    "study",
+                    "discovery",
+                    "physics",
+                    "biology",
+                    "chemistry",
+                    "astronomy",
+                    "experiment",
+                    "scientist",
+                    "journal",
+                  ],
+                };
+
+                const keywords = keywordsMap[topic.name] || [];
+                keywords.forEach((keyword) => {
+                  db.run(
+                    `INSERT INTO keywords (topic_id, keyword, created_at) VALUES (?, ?, ?)`,
+                    [topicId, keyword, timestamp],
+                    function (err) {
+                      if (err) {
+                        console.error(
+                          `Error inserting keyword ${keyword}:`,
+                          err
+                        );
+                      } else {
+                        console.log(
+                          `Inserted keyword: ${keyword} for topic: ${topic.name}`
+                        );
+                      }
+                    }
+                  );
+                });
+              }
+
+              topicsInserted++;
+              if (topicsInserted === defaultTopics.length) {
+                resolve();
+              }
+            }
+          );
+        });
+      }
+    );
   });
 };
 
@@ -208,6 +503,12 @@ const fetchMultiplePages = async (maxPages = 5) => {
     // Always fetch the first page immediately
     await fetchAndStoreHackerNews(1);
 
+    // If FETCH_MULTIPLE_PAGES is false, only fetch the first page
+    if (!FETCH_MULTIPLE_PAGES) {
+      console.log("FETCH_MULTIPLE_PAGES is disabled. Only fetched page 1.");
+      return;
+    }
+
     // Then fetch subsequent pages with rate limiting
     for (let page = 2; page <= maxPages; page++) {
       // Wait 5 seconds between page requests to avoid rate limiting
@@ -218,6 +519,265 @@ const fetchMultiplePages = async (maxPages = 5) => {
     console.log(`Completed fetching ${maxPages} pages from Hacker News`);
   } catch (error) {
     console.error("Error in fetchMultiplePages:", error);
+  }
+};
+
+// Function to categorize a story using Gemini LLM
+const categorizeStory = async (storyTitle) => {
+  if (!CATEGORIZE_STORIES || !process.env.GEMINI_API_KEY) {
+    return null;
+  }
+
+  try {
+    // Get active prompt and all topics
+    const prompt = await getActivePrompt();
+    const topics = await getAllTopics();
+
+    if (!prompt || !topics || topics.length === 0) {
+      console.log("No prompt or topics found for categorization");
+      return null;
+    }
+
+    const topicsList = topics.map((t) => t.name).join(", ");
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        contents: [
+          {
+            parts: [
+              {
+                text: `${prompt.prompt_text}\n\nCategories: ${topicsList}\n\nTitle: "${storyTitle}"`,
+              },
+            ],
+          },
+        ],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    // Extract the response text
+    const responseText =
+      response.data.candidates[0]?.content?.parts[0]?.text || "[]";
+
+    // Try to parse the response as JSON
+    try {
+      const categories = JSON.parse(responseText);
+      if (Array.isArray(categories)) {
+        return categories.length > 0 ? JSON.stringify(categories) : null;
+      }
+    } catch (parseError) {
+      console.error("Error parsing Gemini response as JSON:", parseError);
+    }
+
+    return null;
+  } catch (error) {
+    console.error(
+      "Error categorizing story:",
+      error.response?.data || error.message
+    );
+    return null;
+  }
+};
+
+// Get the active prompt from the database
+const getActivePrompt = () => {
+  return new Promise((resolve, reject) => {
+    db.get(
+      "SELECT * FROM prompts WHERE is_active = 1 ORDER BY id DESC LIMIT 1",
+      (err, row) => {
+        if (err) {
+          console.error("Error getting active prompt:", err);
+          resolve(null);
+          return;
+        }
+        resolve(row);
+      }
+    );
+  });
+};
+
+// Get all topics from the database
+const getAllTopics = () => {
+  return new Promise((resolve, reject) => {
+    db.all("SELECT * FROM topics ORDER BY name", (err, rows) => {
+      if (err) {
+        console.error("Error getting topics:", err);
+        resolve([]);
+        return;
+      }
+      resolve(rows);
+    });
+  });
+};
+
+// Update the storeStories function to include categorization
+const storeStories = async (stories) => {
+  return new Promise(async (resolve, reject) => {
+    if (!stories || stories.length === 0) {
+      resolve();
+      return;
+    }
+
+    // Begin a transaction
+    db.serialize(() => {
+      db.run("BEGIN TRANSACTION");
+
+      const stmt = db.prepare(
+        `
+        INSERT OR REPLACE INTO stories (id, title, url, points, comments, timestamp, submission_datetime, position, categories)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      );
+
+      let completed = 0;
+      let errors = 0;
+
+      const processNextStory = async (index) => {
+        if (index >= stories.length) {
+          finishTransaction();
+          return;
+        }
+
+        const story = stories[index];
+
+        try {
+          // Categorize the story if enabled
+          let categories = null;
+          if (CATEGORIZE_STORIES) {
+            categories = await categorizeStory(story.title);
+          }
+
+          stmt.run(
+            story.id,
+            story.title,
+            story.url,
+            story.points,
+            story.comments,
+            story.timestamp,
+            story.submission_datetime,
+            story.position,
+            categories,
+            function (err) {
+              if (err) {
+                console.error(`Error storing story ${story.id}:`, err);
+                errors++;
+              } else {
+                completed++;
+              }
+
+              // Process the next story
+              processNextStory(index + 1);
+            }
+          );
+        } catch (error) {
+          console.error(`Error processing story ${story.id}:`, error);
+          errors++;
+          processNextStory(index + 1);
+        }
+      };
+
+      const finishTransaction = () => {
+        stmt.finalize();
+
+        db.run("COMMIT", (err) => {
+          if (err) {
+            console.error("Error committing transaction:", err);
+            reject(err);
+            return;
+          }
+
+          console.log(`Stored ${completed} stories (${errors} errors)`);
+          resolve();
+        });
+      };
+
+      // Start processing stories
+      processNextStory(0);
+    });
+  });
+};
+
+// Function to categorize uncategorized stories
+const categorizeUncategorizedStories = async (batchSize = 5) => {
+  if (!CATEGORIZE_STORIES || !process.env.GEMINI_API_KEY) {
+    return;
+  }
+
+  try {
+    console.log(
+      `Looking for uncategorized stories to process (batch size: ${batchSize})...`
+    );
+
+    // Get uncategorized stories
+    const stories = await new Promise((resolve, reject) => {
+      db.all(
+        `SELECT id, title FROM stories WHERE categories IS NULL ORDER BY timestamp DESC LIMIT ?`,
+        [batchSize],
+        (err, rows) => {
+          if (err) {
+            console.error("Error fetching uncategorized stories:", err);
+            resolve([]);
+            return;
+          }
+          resolve(rows);
+        }
+      );
+    });
+
+    if (stories.length === 0) {
+      console.log("No uncategorized stories found.");
+      return;
+    }
+
+    console.log(`Found ${stories.length} uncategorized stories to process.`);
+
+    // Process each story with a delay to avoid rate limiting
+    for (const story of stories) {
+      try {
+        console.log(`Categorizing story: ${story.id} - ${story.title}`);
+        const categories = await categorizeStory(story.title);
+
+        if (categories) {
+          // Update the story with categories
+          await new Promise((resolve, reject) => {
+            db.run(
+              `UPDATE stories SET categories = ? WHERE id = ?`,
+              [categories, story.id],
+              function (err) {
+                if (err) {
+                  console.error(
+                    `Error updating story ${story.id} with categories:`,
+                    err
+                  );
+                } else {
+                  console.log(
+                    `Updated story ${story.id} with categories: ${categories}`
+                  );
+                }
+                resolve();
+              }
+            );
+          });
+        } else {
+          console.log(`No categories found for story ${story.id}`);
+        }
+
+        // Add a delay between API calls to avoid rate limiting
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      } catch (error) {
+        console.error(`Error processing story ${story.id}:`, error);
+      }
+    }
+
+    console.log(`Completed categorizing batch of ${stories.length} stories.`);
+  } catch (error) {
+    console.error("Error in categorizeUncategorizedStories:", error);
   }
 };
 
@@ -288,6 +848,329 @@ app.post("/api/fetch-stories", async (req, res) => {
   }
 });
 
+// Test Gemini API endpoint
+app.get("/api/test-gemini", async (req, res) => {
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    console.log("Testing Gemini API with key:", apiKey);
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        contents: [
+          {
+            parts: [{ text: "Explain how AI works" }],
+          },
+        ],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log("Gemini API Response:", JSON.stringify(response.data, null, 2));
+
+    res.json({
+      success: true,
+      data: response.data,
+    });
+  } catch (error) {
+    console.error(
+      "Error testing Gemini API:",
+      error.response?.data || error.message
+    );
+    res.status(500).json({
+      error: "Failed to test Gemini API",
+      details: error.response?.data || error.message,
+    });
+  }
+});
+
+// API endpoints for managing prompts, topics, and keywords
+app.get("/api/prompts", async (req, res) => {
+  try {
+    db.all("SELECT * FROM prompts ORDER BY created_at DESC", (err, rows) => {
+      if (err) {
+        console.error("Error fetching prompts:", err);
+        res.status(500).json({ error: "Failed to fetch prompts" });
+        return;
+      }
+      res.json(rows);
+    });
+  } catch (error) {
+    console.error("Error in /api/prompts:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/prompts", async (req, res) => {
+  try {
+    const { name, prompt_text } = req.body;
+
+    if (!name || !prompt_text) {
+      res.status(400).json({ error: "Name and prompt text are required" });
+      return;
+    }
+
+    const timestamp = Date.now();
+
+    db.run(
+      "INSERT INTO prompts (name, prompt_text, created_at) VALUES (?, ?, ?)",
+      [name, prompt_text, timestamp],
+      function (err) {
+        if (err) {
+          console.error("Error creating prompt:", err);
+          res.status(500).json({ error: "Failed to create prompt" });
+          return;
+        }
+
+        res.status(201).json({
+          id: this.lastID,
+          name,
+          prompt_text,
+          created_at: timestamp,
+          is_active: 0,
+        });
+      }
+    );
+  } catch (error) {
+    console.error("Error in POST /api/prompts:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.put("/api/prompts/:id/activate", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // First, deactivate all prompts
+    db.run("UPDATE prompts SET is_active = 0", (err) => {
+      if (err) {
+        console.error("Error deactivating prompts:", err);
+        res.status(500).json({ error: "Failed to activate prompt" });
+        return;
+      }
+
+      // Then, activate the specified prompt
+      db.run(
+        "UPDATE prompts SET is_active = 1 WHERE id = ?",
+        [id],
+        function (err) {
+          if (err) {
+            console.error("Error activating prompt:", err);
+            res.status(500).json({ error: "Failed to activate prompt" });
+            return;
+          }
+
+          if (this.changes === 0) {
+            res.status(404).json({ error: "Prompt not found" });
+            return;
+          }
+
+          res.json({ success: true, message: "Prompt activated" });
+        }
+      );
+    });
+  } catch (error) {
+    console.error("Error in PUT /api/prompts/:id/activate:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/topics", async (req, res) => {
+  try {
+    db.all("SELECT * FROM topics ORDER BY name", (err, rows) => {
+      if (err) {
+        console.error("Error fetching topics:", err);
+        res.status(500).json({ error: "Failed to fetch topics" });
+        return;
+      }
+      res.json(rows);
+    });
+  } catch (error) {
+    console.error("Error in /api/topics:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/topics", async (req, res) => {
+  try {
+    const { name, description } = req.body;
+
+    if (!name) {
+      res.status(400).json({ error: "Topic name is required" });
+      return;
+    }
+
+    const timestamp = Date.now();
+
+    db.run(
+      "INSERT INTO topics (name, description, created_at) VALUES (?, ?, ?)",
+      [name, description || "", timestamp],
+      function (err) {
+        if (err) {
+          if (err.message.includes("UNIQUE constraint failed")) {
+            res
+              .status(409)
+              .json({ error: "Topic with this name already exists" });
+            return;
+          }
+
+          console.error("Error creating topic:", err);
+          res.status(500).json({ error: "Failed to create topic" });
+          return;
+        }
+
+        res.status(201).json({
+          id: this.lastID,
+          name,
+          description: description || "",
+          created_at: timestamp,
+        });
+      }
+    );
+  } catch (error) {
+    console.error("Error in POST /api/topics:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/api/topics/:id/keywords", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    db.all(
+      "SELECT * FROM keywords WHERE topic_id = ? ORDER BY keyword",
+      [id],
+      (err, rows) => {
+        if (err) {
+          console.error("Error fetching keywords:", err);
+          res.status(500).json({ error: "Failed to fetch keywords" });
+          return;
+        }
+        res.json(rows);
+      }
+    );
+  } catch (error) {
+    console.error("Error in /api/topics/:id/keywords:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.post("/api/topics/:id/keywords", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { keyword } = req.body;
+
+    if (!keyword) {
+      res.status(400).json({ error: "Keyword is required" });
+      return;
+    }
+
+    const timestamp = Date.now();
+
+    db.run(
+      "INSERT INTO keywords (topic_id, keyword, created_at) VALUES (?, ?, ?)",
+      [id, keyword, timestamp],
+      function (err) {
+        if (err) {
+          if (err.message.includes("UNIQUE constraint failed")) {
+            res
+              .status(409)
+              .json({ error: "Keyword already exists for this topic" });
+            return;
+          }
+
+          console.error("Error creating keyword:", err);
+          res.status(500).json({ error: "Failed to create keyword" });
+          return;
+        }
+
+        res.status(201).json({
+          id: this.lastID,
+          topic_id: parseInt(id),
+          keyword,
+          created_at: timestamp,
+        });
+      }
+    );
+  } catch (error) {
+    console.error("Error in POST /api/topics/:id/keywords:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/api/keywords/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    db.run("DELETE FROM keywords WHERE id = ?", [id], function (err) {
+      if (err) {
+        console.error("Error deleting keyword:", err);
+        res.status(500).json({ error: "Failed to delete keyword" });
+        return;
+      }
+
+      if (this.changes === 0) {
+        res.status(404).json({ error: "Keyword not found" });
+        return;
+      }
+
+      res.json({ success: true, message: "Keyword deleted" });
+    });
+  } catch (error) {
+    console.error("Error in DELETE /api/keywords/:id:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Add endpoint to get categorized stories
+app.get("/api/stories/categorized", async (req, res) => {
+  try {
+    const { category } = req.query;
+
+    let query = "SELECT * FROM stories WHERE categories IS NOT NULL";
+    const params = [];
+
+    if (category) {
+      // Search for stories that have the specified category in their JSON array
+      query += " AND categories LIKE ?";
+      params.push(`%${category}%`);
+    }
+
+    query += " ORDER BY timestamp DESC LIMIT 100";
+
+    db.all(query, params, (err, rows) => {
+      if (err) {
+        console.error("Error fetching categorized stories:", err);
+        res.status(500).json({ error: "Failed to fetch categorized stories" });
+        return;
+      }
+
+      // Parse the categories JSON string for each story
+      const stories = rows.map((story) => {
+        try {
+          if (story.categories) {
+            story.categories = JSON.parse(story.categories);
+          } else {
+            story.categories = [];
+          }
+        } catch (e) {
+          story.categories = [];
+        }
+        return story;
+      });
+
+      res.json(stories);
+    });
+  } catch (error) {
+    console.error("Error in /api/stories/categorized:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // Serve static files in production
 if (process.env.NODE_ENV === "production") {
   app.use(express.static(path.join(__dirname, "dist")));
@@ -299,19 +1182,41 @@ if (process.env.NODE_ENV === "production") {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Auto-fetch enabled: ${AUTO_FETCH_ENABLED}`);
+  console.log(`Fetch multiple pages: ${FETCH_MULTIPLE_PAGES}`);
+  console.log(`Categorize stories: ${CATEGORIZE_STORIES}`);
 
   // Fetch stories on server start
   fetchMultiplePages().catch(console.error);
 
-  // Set up periodic scraping of the front page every minute
-  setInterval(() => {
-    console.log("Running scheduled update of Hacker News front page");
-    fetchAndStoreHackerNews(1).catch(console.error);
-  }, 60000); // 60000 ms = 1 minute
+  // Set up periodic scraping of the front page every minute if enabled
+  if (AUTO_FETCH_ENABLED) {
+    setInterval(() => {
+      console.log("Running scheduled update of Hacker News front page");
+      fetchAndStoreHackerNews(1).catch(console.error);
+    }, 60000); // 60000 ms = 1 minute
 
-  // Set up periodic full refresh (all pages) every 30 minutes
-  setInterval(() => {
-    console.log("Running scheduled full refresh of all Hacker News pages");
-    fetchMultiplePages().catch(console.error);
-  }, 1800000); // 1800000 ms = 30 minutes
+    // Set up periodic full refresh (all pages) every 30 minutes
+    setInterval(() => {
+      console.log("Running scheduled full refresh of all Hacker News pages");
+      fetchMultiplePages().catch(console.error);
+    }, 1800000); // 1800000 ms = 30 minutes
+  }
+
+  // Set up periodic categorization of uncategorized stories
+  if (CATEGORIZE_STORIES) {
+    // Start after a short delay to allow the server to initialize
+    setTimeout(() => {
+      // Run once at startup
+      categorizeUncategorizedStories(5).catch(console.error);
+
+      // Then run every 5 minutes
+      setInterval(() => {
+        console.log(
+          "Running scheduled categorization of uncategorized stories"
+        );
+        categorizeUncategorizedStories(5).catch(console.error);
+      }, 300000); // 300000 ms = 5 minutes
+    }, 10000); // 10 second initial delay
+  }
 });
