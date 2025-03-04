@@ -23,7 +23,7 @@ export const StoryList = ({ filter = "all" }: StoryListProps) => {
       return hostname !== "news.ycombinator.com"
         ? hostname.replace("www.", "")
         : "";
-    } catch (error) {
+    } catch {
       return "";
     }
   };
@@ -46,10 +46,10 @@ export const StoryList = ({ filter = "all" }: StoryListProps) => {
     setLoading(true);
     setError(null);
     try {
-      // For top filters, we need to fetch more stories to ensure we have enough from each day
-      const initialLimit = ["10", "20", "half"].includes(filter) ? 100 : 30;
+      // Always fetch enough stories to cover 4 days
+      const initialLimit = 200;
 
-      const data = await fetchStories(1, initialLimit, filter);
+      const data = await fetchStories(1, initialLimit);
       console.log(`StoryList received ${data.length} stories`);
       setStories(data);
       setPage(1);
@@ -68,12 +68,12 @@ export const StoryList = ({ filter = "all" }: StoryListProps) => {
     setLoadingMore(true);
     try {
       const nextPage = page + 1;
-      const moreStories = await fetchStories(nextPage, 30, filter);
+      const moreStories = await fetchStories(nextPage, 50);
 
       if (moreStories.length > 0) {
         setStories((prevStories) => [...prevStories, ...moreStories]);
         setPage(nextPage);
-        setHasMore(moreStories.length === 30);
+        setHasMore(moreStories.length === 50);
       } else {
         setHasMore(false);
       }
@@ -107,26 +107,10 @@ export const StoryList = ({ filter = "all" }: StoryListProps) => {
     loadStories();
   }, []);
 
-  useEffect(() => {
-    // Reset when filter changes
-    loadStories();
-  }, [filter]);
-
-  if (loading && stories.length === 0) {
-    return <div className="loading">Loading stories...</div>;
-  }
-
-  // Format today's date as YYYYMMDD for the ID
-  const today = new Date();
-  const dateId = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(
-    2,
-    "0"
-  )}${String(today.getDate()).padStart(2, "0")}`;
-
   // Convert a timestamp to Eastern Time date string (YYYY-MM-DD)
   const getEasternTimeDateStr = (timestamp: number): string => {
     // Create date in local time
-    const date = new Date(timestamp * 1000); // Convert from Unix timestamp (seconds) to JS timestamp (milliseconds)
+    const date = new Date(timestamp);
 
     // Convert to Eastern Time
     const easternTime = new Date(
@@ -139,92 +123,105 @@ export const StoryList = ({ filter = "all" }: StoryListProps) => {
     ).padStart(2, "0")}-${String(easternTime.getDate()).padStart(2, "0")}`;
   };
 
-  // Group stories by day in Eastern Time based on submission timestamp
-  const storiesByDay = stories.reduce<Record<string, Story[]>>((acc, story) => {
-    // Use submitted_timestamp if available, otherwise fall back to timestamp
-    const storyTimestamp = story.submitted_timestamp || story.timestamp;
+  // Format a timestamp to "Mon, Mar 3" format in Eastern Time
+  const formatEasternTimeDate = (timestamp: number): string => {
+    const date = new Date(timestamp);
+    const options: Intl.DateTimeFormatOptions = {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      timeZone: "America/New_York",
+    };
+    return date.toLocaleDateString("en-US", options);
+  };
 
-    // Get Eastern Time date string
-    const dateStr = getEasternTimeDateStr(
-      // If using the regular timestamp (which is in milliseconds), convert to seconds
-      story.submitted_timestamp
-        ? storyTimestamp
-        : Math.floor(storyTimestamp / 1000)
-    );
+  // Group stories by day in Eastern Time based on submission_datetime
+  const groupStoriesByDay = (storyList: Story[]) => {
+    return storyList.reduce<Record<string, Story[]>>((acc, story) => {
+      // Use submission_datetime if available
+      if (!story.submission_datetime) {
+        return acc;
+      }
 
-    if (!acc[dateStr]) {
-      acc[dateStr] = [];
-    }
+      // Get Eastern Time date string
+      const dateStr = getEasternTimeDateStr(story.submission_datetime);
 
-    acc[dateStr].push(story);
-    return acc;
-  }, {});
+      if (!acc[dateStr]) {
+        acc[dateStr] = [];
+      }
 
-  // For each day, identify the top N stories by points but preserve original order
-  const getTopStoriesByDay = (limit: number | string) => {
+      acc[dateStr].push(story);
+      return acc;
+    }, {});
+  };
+
+  // For each day, identify the top N stories by points but preserve original order within each day
+  const getTopStoriesByDay = (storyList: Story[], limit: number | string) => {
+    const storiesByDay = groupStoriesByDay(storyList);
     const result: Story[] = [];
 
     // Process each day
-    Object.keys(storiesByDay).forEach((dateStr) => {
-      const dayStories = [...storiesByDay[dateStr]];
+    Object.keys(storiesByDay)
+      .sort()
+      .reverse() // Sort days in reverse chronological order
+      .forEach((dateStr) => {
+        const dayStories = [...storiesByDay[dateStr]];
 
-      // Sort by points to identify top stories
-      const sortedByPoints = [...dayStories].sort(
-        (a, b) => b.points - a.points
-      );
+        // Sort by points to identify top stories
+        const sortedByPoints = [...dayStories].sort(
+          (a, b) => b.points - a.points
+        );
 
-      // Determine how many stories to take
-      let numToTake: number;
-      if (typeof limit === "number") {
-        numToTake = limit;
-      } else if (limit === "half") {
-        numToTake = Math.ceil(dayStories.length / 2);
-      } else {
-        numToTake = dayStories.length;
-      }
+        // Determine how many stories to take
+        let numToTake: number;
+        if (typeof limit === "number") {
+          numToTake = limit;
+        } else if (limit === "half") {
+          numToTake = Math.ceil(dayStories.length / 2);
+        } else {
+          numToTake = dayStories.length;
+        }
 
-      // Get the top N stories by points
-      const topStoryIds = sortedByPoints.slice(0, numToTake).map((s) => s.id);
+        // Get the top N stories by points
+        const topStoryIds = sortedByPoints.slice(0, numToTake).map((s) => s.id);
 
-      // Filter the original day stories to only include top stories, preserving original order
-      const topStoriesInOriginalOrder = dayStories.filter((story) =>
-        topStoryIds.includes(story.id)
-      );
+        // Filter the original day stories to only include top stories, preserving original order
+        const topStoriesInOriginalOrder = dayStories.filter((story) =>
+          topStoryIds.includes(story.id)
+        );
 
-      result.push(...topStoriesInOriginalOrder);
-    });
+        result.push(...topStoriesInOriginalOrder);
+      });
 
-    // Sort all stories by timestamp (newest first)
-    return result.sort((a, b) => {
-      // Use submitted_timestamp if available, otherwise fall back to timestamp
-      const aTimestamp = a.submitted_timestamp || a.timestamp;
-      const bTimestamp = b.submitted_timestamp || b.timestamp;
-      return bTimestamp - aTimestamp;
-    });
+    return result;
   };
+
+  // Format today's date as YYYYMMDD for the ID
+  const today = new Date();
+  const dateId = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(
+    2,
+    "0"
+  )}${String(today.getDate()).padStart(2, "0")}`;
 
   // Filter stories based on the active filter
   let filteredStories: Story[] = [];
 
   if (filter === "all") {
-    // Sort all stories by timestamp (newest first)
-    filteredStories = [...stories].sort((a, b) => {
-      // Use submitted_timestamp if available, otherwise fall back to timestamp
-      const aTimestamp = a.submitted_timestamp || a.timestamp;
-      const bTimestamp = b.submitted_timestamp || b.timestamp;
-      return bTimestamp - aTimestamp;
-    });
+    // Sort all stories by submission_datetime (newest first)
+    filteredStories = [...stories]
+      .filter((story) => story.submission_datetime)
+      .sort((a, b) => {
+        return (b.submission_datetime || 0) - (a.submission_datetime || 0);
+      });
   } else if (filter === "10") {
-    filteredStories = getTopStoriesByDay(10);
+    filteredStories = getTopStoriesByDay(stories, 10);
   } else if (filter === "20") {
-    filteredStories = getTopStoriesByDay(20);
+    filteredStories = getTopStoriesByDay(stories, 20);
   } else if (filter === "half") {
-    filteredStories = getTopStoriesByDay("half");
+    filteredStories = getTopStoriesByDay(stories, "half");
   } else if (filter === "homepage") {
-    // For homepage filter, the server already filtered the stories
+    // For homepage filter, sort by position to match the HN homepage order
     filteredStories = [...stories];
-
-    // Sort by position to match the HN homepage order
     if (
       filteredStories.length > 0 &&
       filteredStories[0].position !== undefined
@@ -234,6 +231,66 @@ export const StoryList = ({ filter = "all" }: StoryListProps) => {
       });
     }
   }
+
+  if (loading && stories.length === 0) {
+    return <div className="loading">Loading stories...</div>;
+  }
+
+  // Group filtered stories by day for rendering with date separators
+  const renderStoriesWithDateSeparators = () => {
+    if (filteredStories.length === 0) return null;
+
+    let currentDate = "";
+    const result = [];
+
+    // Get today's date in Eastern Time
+    const today = new Date();
+    const todayEastern = new Date(
+      today.toLocaleString("en-US", { timeZone: "America/New_York" })
+    );
+    const todayDateStr = `${todayEastern.getFullYear()}-${String(
+      todayEastern.getMonth() + 1
+    ).padStart(2, "0")}-${String(todayEastern.getDate()).padStart(2, "0")}`;
+
+    for (let i = 0; i < filteredStories.length; i++) {
+      const story = filteredStories[i];
+
+      if (!story.submission_datetime) continue;
+
+      const storyDate = getEasternTimeDateStr(story.submission_datetime);
+
+      // Add date separator if this is a new day and not today
+      if (storyDate !== currentDate) {
+        currentDate = storyDate;
+
+        // Only add the date header if it's not today
+        if (storyDate !== todayDateStr) {
+          const formattedDate = formatEasternTimeDate(
+            story.submission_datetime
+          );
+
+          result.push(
+            <li key={`date-${storyDate}`} className="date-separator">
+              <div className="date-header">{formattedDate}</div>
+            </li>
+          );
+        }
+      }
+
+      // Add the story item
+      const isLastElement = i === filteredStories.length - 1;
+      result.push(
+        <StoryItem
+          key={story.id}
+          story={story}
+          domain={story.url ? getDomainFromUrl(story.url) : ""}
+          ref={isLastElement ? lastStoryElementRef : null}
+        />
+      );
+    }
+
+    return result;
+  };
 
   return (
     <>
@@ -257,57 +314,35 @@ export const StoryList = ({ filter = "all" }: StoryListProps) => {
           </button>
         </div>
       )}
+
+      {error && (
+        <div className="error-message">
+          <p>{error}</p>
+          <button
+            onClick={handleRefresh}
+            disabled={refreshing}
+            style={{
+              padding: "5px 10px",
+              backgroundColor: "#ff6600",
+              color: "white",
+              border: "none",
+              borderRadius: "5px",
+              cursor: "pointer",
+              marginTop: "10px",
+            }}
+          >
+            {refreshing ? "Refreshing..." : "Try Again"}
+          </button>
+        </div>
+      )}
+
       <ul className="entries unstyled" id={dateId}>
-        {filteredStories.length > 0 &&
-          filteredStories.map((story, index) => {
-            if (filteredStories.length === index + 1) {
-              return (
-                <li
-                  ref={lastStoryElementRef}
-                  className="entry row"
-                  id={`${story.id}`}
-                  key={story.id}
-                >
-                  <a
-                    href={`https://news.ycombinator.com/item?id=${story.id}`}
-                    className="comments span2"
-                  >
-                    {story.comments}
-                  </a>
-                  <span
-                    className={`points span1 ${
-                      story.position ? "homepage" : ""
-                    }`}
-                  >
-                    {story.points}
-                  </span>
-                  <a
-                    className={`link span15 story ${
-                      story.comments === 0 && story.points === 0 ? "job" : ""
-                    }`}
-                    href={
-                      story.url ||
-                      `https://news.ycombinator.com/item?id=${story.id}`
-                    }
-                  >
-                    {story.title}
-                    {story.url && (
-                      <span className="source">
-                        {" "}
-                        ({getDomainFromUrl(story.url)})
-                      </span>
-                    )}
-                  </a>
-                </li>
-              );
-            } else {
-              return <StoryItem key={story.id} story={story} />;
-            }
-          })}
+        {renderStoriesWithDateSeparators()}
         {stories.length > 0 && filteredStories.length === 0 && (
           <li className="entry row">No stories match the current filter</li>
         )}
       </ul>
+
       {loadingMore && <div className="loading">Loading more stories...</div>}
       {!hasMore && stories.length > 0 && (
         <div className="no-more-stories">No more stories to load</div>

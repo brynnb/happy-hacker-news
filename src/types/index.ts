@@ -6,5 +6,5 @@ export interface Story {
   comments: number;
   timestamp: number;
   position?: number;
-  submitted_timestamp?: number;
+  submission_datetime?: number;
 }
