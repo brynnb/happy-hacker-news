@@ -7,6 +7,10 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import fs from "fs";
 import dotenv from "dotenv";
+import {
+  categorizeStory as geminiCategorizeStory,
+  testGeminiApi,
+} from "./geminiApi.js";
 
 // Load environment variables
 dotenv.config();
@@ -538,44 +542,17 @@ const categorizeStory = async (storyTitle) => {
       return null;
     }
 
-    const topicsList = topics.map((t) => t.name).join(", ");
+    const topicNames = topics.map((t) => t.name);
 
-    const apiKey = process.env.GEMINI_API_KEY;
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        contents: [
-          {
-            parts: [
-              {
-                text: `${prompt.prompt_text}\n\nCategories: ${topicsList}\n\nTitle: "${storyTitle}"`,
-              },
-            ],
-          },
-        ],
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
+    // Use the geminiApi module to categorize the story
+    const categories = await geminiCategorizeStory(
+      storyTitle,
+      prompt.prompt_text,
+      topicNames
     );
 
-    // Extract the response text
-    const responseText =
-      response.data.candidates[0]?.content?.parts[0]?.text || "[]";
-
-    // Try to parse the response as JSON
-    try {
-      const categories = JSON.parse(responseText);
-      if (Array.isArray(categories)) {
-        return categories.length > 0 ? JSON.stringify(categories) : null;
-      }
-    } catch (parseError) {
-      console.error("Error parsing Gemini response as JSON:", parseError);
-    }
-
-    return null;
+    // Return stringified categories if available
+    return categories ? JSON.stringify(categories) : null;
   } catch (error) {
     console.error(
       "Error categorizing story:",
@@ -705,7 +682,7 @@ const storeStories = async (stories) => {
 
 // Function to categorize uncategorized stories
 const categorizeUncategorizedStories = async (batchSize = 5) => {
-  if (!CATEGORIZE_STORIES || !process.env.GEMINI_API_KEY) {
+  if (!CATEGORIZE_STORIES) {
     return;
   }
 
@@ -851,30 +828,15 @@ app.post("/api/fetch-stories", async (req, res) => {
 // Test Gemini API endpoint
 app.get("/api/test-gemini", async (req, res) => {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-    console.log("Testing Gemini API with key:", apiKey);
+    console.log("Testing Gemini API...");
 
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        contents: [
-          {
-            parts: [{ text: "Explain how AI works" }],
-          },
-        ],
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-      }
-    );
+    const response = await testGeminiApi();
 
-    console.log("Gemini API Response:", JSON.stringify(response.data, null, 2));
+    console.log("Gemini API Response:", JSON.stringify(response, null, 2));
 
     res.json({
       success: true,
-      data: response.data,
+      data: response,
     });
   } catch (error) {
     console.error(
@@ -883,7 +845,7 @@ app.get("/api/test-gemini", async (req, res) => {
     );
     res.status(500).json({
       error: "Failed to test Gemini API",
-      details: error.response?.data || error.message,
+      details: error.message,
     });
   }
 });
